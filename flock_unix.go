@@ -7,6 +7,7 @@
 package flock
 
 import (
+	"os"
 	"syscall"
 )
 
@@ -53,7 +54,13 @@ func (f *Flock) lock(locked *bool, flag int) error {
 	}
 
 	if err := syscall.Flock(int(f.fh.Fd()), flag); err != nil {
-		return err
+		if f.retryError(err) {
+			if err = syscall.Flock(int(f.fh.Fd()), flag); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 
 	*locked = true
@@ -137,6 +144,8 @@ func (f *Flock) try(locked *bool, flag int) (bool, error) {
 		}
 	}
 
+	retried := false
+retry:
 	err := syscall.Flock(int(f.fh.Fd()), flag|syscall.LOCK_NB)
 
 	switch err {
@@ -146,6 +155,37 @@ func (f *Flock) try(locked *bool, flag int) (bool, error) {
 		*locked = true
 		return true, nil
 	}
+	if !retried && f.retryError(err) {
+		retried = true
+		goto retry
+	}
 
 	return false, err
+}
+
+// retryError determines whether we should reopen the file handle in readwrite
+// mode and try again. This comes from util-linux/sys-utils/flock.c:
+//  Since Linux 3.4 (commit 55725513)
+//  Probably NFSv4 where flock() is emulated by fcntl().
+func (f *Flock) retryError(err error) bool {
+
+	if err != syscall.EIO && err != syscall.EBADF {
+		return false
+	}
+	if st, err := f.fh.Stat(); err == nil {
+		// if the file is able to be read and written
+		if st.Mode()&0600 == 0600 {
+			f.fh.Close()
+			f.fh = nil
+
+			// reopen in read-write mode and set the filehandle
+			fh, err := os.OpenFile(f.path, os.O_CREATE|os.O_RDWR, os.FileMode(0600))
+			if err == nil {
+				f.fh = fh
+				return true
+			}
+		}
+	}
+
+	return false
 }
